@@ -1,4 +1,4 @@
-import os 
+import os
 import time
 import requests
 from datetime import datetime, timedelta, timezone
@@ -43,6 +43,15 @@ TRAVEL_BUFFER_MIN = 30
 
 # Surfing is allowed from this long before sunrise until sunset.
 FIRST_LIGHT_BUFFER_MIN = 30
+
+# If the forecast has no PEAK swell period for a spot, the (lower) MEAN period is used
+# instead, multiplied by this rough factor so it is comparable. It is only an
+# approximation - the script prints a warning whenever it has to be used.
+MEAN_PERIOD_FALLBACK_FACTOR = 1.2
+
+# How many spots to ask the weather service about in one request.
+# Fewer, bigger requests are much kinder to the free service than one per spot.
+SPOTS_PER_REQUEST = 8
 
 # Relaxed TEST_MODE limits. NOT surf advice.
 TEST_MIN_SWELL_M = 0.1
@@ -449,50 +458,59 @@ def tide_states(levels):
     return states
 
 
-def get_forecast(lat, lon):
-    """Hourly swell, wind and tide for one location."""
-    marine_response = requests.get(
-        "https://marine-api.open-meteo.com/v1/marine",
-        params={
-            "latitude": lat, "longitude": lon,
-            "hourly": ("swell_wave_height,swell_wave_peak_period,"
-                       "swell_wave_direction,sea_level_height_msl"),
-            "timezone": "Africa/Johannesburg",
-            "forecast_days": 7,
-            "cell_selection": "sea",
-        },
-        timeout=20,
-    )
-    marine_response.raise_for_status()
-    marine = marine_response.json()["hourly"]
+FALLBACK_SPOTS = []   # filled in when peak period is missing for a spot
 
-    wind_response = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": lat, "longitude": lon,
-            "hourly": "wind_speed_10m,wind_direction_10m",
-            "wind_speed_unit": "kn",
-            "timezone": "Africa/Johannesburg",
-            "forecast_days": 7,
-        },
-        timeout=20,
-    )
-    wind_response.raise_for_status()
-    wind = wind_response.json()["hourly"]
+MARINE_URL = "https://marine-api.open-meteo.com/v1/marine"
+WIND_URL = "https://api.open-meteo.com/v1/forecast"
 
+
+def fetch_json(url, params, attempts=3, timeout=40):
+    """GET with retries, so one slow reply doesn't ruin the whole run."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+            return response.json()
+        except Exception as error:
+            last_error = error
+            print(f"    attempt {attempt}/{attempts} failed: {error}")
+            if attempt < attempts:
+                time.sleep(4 * attempt)
+    raise last_error
+
+
+def build_hours(marine, wind):
+    """Turn one spot's raw marine + wind data into a clean list of hourly dicts."""
     wind_index = {t: i for i, t in enumerate(wind["time"])}
     tides = tide_states(marine.get("sea_level_height_msl") or [None] * len(marine["time"]))
+    mean_periods = marine.get("swell_wave_period") or [None] * len(marine["time"])
 
     hours = []
+    nulls = {"swell": 0, "period": 0, "wind": 0}
+    used_fallback = 0
+
     for i, stamp in enumerate(marine["time"]):
         j = wind_index.get(stamp)
         if j is None:
             continue
         swell = marine["swell_wave_height"][i]
         period = marine["swell_wave_peak_period"][i]
+        if period is None and mean_periods[i] is not None:
+            period = mean_periods[i] * MEAN_PERIOD_FALLBACK_FACTOR
+            used_fallback += 1
         wind_speed = wind["wind_speed_10m"][j]
+
+        if swell is None:
+            nulls["swell"] += 1
+        if period is None:
+            nulls["period"] += 1
+        if wind_speed is None:
+            nulls["wind"] += 1
         if swell is None or period is None or wind_speed is None:
             continue
+
         tide = tides[i]
         hours.append({
             "time": datetime.fromisoformat(stamp).replace(tzinfo=TIMEZONE),
@@ -504,7 +522,64 @@ def get_forecast(lat, lon):
             "tide_stage": tide[0] if tide else None,
             "tide_move": tide[1] if tide else None,
         })
+
+    if not hours:
+        raise ValueError(f"no usable rows (missing values: {nulls})")
+    if used_fallback:
+        FALLBACK_SPOTS.append(used_fallback)
     return hours
+
+
+def get_all_forecasts():
+    """Fetch every spot's forecast in a few batched requests. Returns {spot name: hours}."""
+    names = list(SURF_SPOTS)
+    results = {}
+
+    for start in range(0, len(names), SPOTS_PER_REQUEST):
+        chunk = names[start:start + SPOTS_PER_REQUEST]
+        lats = ",".join(str(SURF_SPOTS[n]["lat"]) for n in chunk)
+        lons = ",".join(str(SURF_SPOTS[n]["lon"]) for n in chunk)
+        print(f"Fetching forecasts for spots {start + 1}-{start + len(chunk)} of {len(names)}...")
+
+        try:
+            marine = fetch_json(MARINE_URL, {
+                "latitude": lats, "longitude": lons,
+                "hourly": ("swell_wave_height,swell_wave_peak_period,swell_wave_period,"
+                           "swell_wave_direction,sea_level_height_msl"),
+                "timezone": "Africa/Johannesburg",
+                "forecast_days": 7,
+                "cell_selection": "sea",
+            })
+            wind = fetch_json(WIND_URL, {
+                "latitude": lats, "longitude": lons,
+                "hourly": "wind_speed_10m,wind_direction_10m",
+                "wind_speed_unit": "kn",
+                "timezone": "Africa/Johannesburg",
+                "forecast_days": 7,
+            })
+        except Exception as error:
+            print(f"  Could not fetch this batch: {error}")
+            continue
+
+        # One location returns an object; several return a list.
+        if isinstance(marine, dict):
+            marine = [marine]
+        if isinstance(wind, dict):
+            wind = [wind]
+
+        for name, m, w in zip(chunk, marine, wind):
+            try:
+                results[name] = build_hours(m["hourly"], w["hourly"])
+            except Exception as error:
+                print(f"  {name}: {error}")
+
+        time.sleep(1)
+
+    print(f"Got forecast data for {len(results)} of {len(names)} spots.")
+    if FALLBACK_SPOTS:
+        print(f"NOTE: peak swell period was missing for {len(FALLBACK_SPOTS)} spot(s); "
+              f"used mean period x {MEAN_PERIOD_FALLBACK_FACTOR} instead (approximate).")
+    return results
 
 
 def tide_ok(hour, spot):
@@ -569,21 +644,15 @@ def check_all_spots():
         print(f"Could not get sunrise/sunset ({error}); using 06:00-19:00 instead.")
         daylight = {}
 
+    forecasts = get_all_forecasts()
     matches = []
     failed = 0
 
     for spot_name, spot in SURF_SPOTS.items():
         print(f"\nChecking {spot_name}...")
-        try:
-            hours = get_forecast(spot["lat"], spot["lon"])
-        except Exception as error:
-            print(f"  Could not get forecast: {error}")
-            failed += 1
-            continue
-        time.sleep(0.3)   # be polite to the free API
-
+        hours = forecasts.get(spot_name)
         if not hours:
-            print("  No usable forecast data returned.")
+            print("  No forecast data for this spot.")
             failed += 1
             continue
 
@@ -610,9 +679,14 @@ def check_all_spots():
             print("  No matching window.")
 
     matches.sort(key=lambda m: m[1]["time"])
-
+    total = len(SURF_SPOTS)
     mode = "TEST MODE (relaxed, not surf advice)" if TEST_MODE else "strict"
-    if matches:
+
+    if failed == total:
+        message = ("Couldn't get any forecast data today - the weather service didn't "
+                   "respond. I'll try again tomorrow morning.")
+        title = "Squiggly Wiggly - Forecast Unavailable"
+    elif matches:
         lines = [f"- {name}: {day_label(h['time'], now)} {h['time']:%H:%M} | "
                  f"{h['swell_m']:.1f}m {h['period_s']:.0f}s {h['swell_dir']} | "
                  f"{h['wind_kn']:.0f}kn {h['wind_dir']}{tide_text(h)}"
@@ -628,7 +702,7 @@ def check_all_spots():
                    f"{LOOKAHEAD_DAYS} days [{mode}]. Check back tomorrow morning.")
         title = "Squiggly Wiggly - No Surf Today"
 
-    if failed:
+    if 0 < failed < total:
         message += f"\n({failed} spot(s) could not be checked.)"
 
     print("\n" + message)
@@ -636,8 +710,11 @@ def check_all_spots():
         send_phone_notification(message, title)
     except Exception as error:
         print(f"Could not send notification: {error}")
+        raise SystemExit(1)   # makes the GitHub run show a red cross
 
     print("\nFinished checking all spots.")
+    if failed == total:
+        raise SystemExit(1)   # no data at all: also show a red cross
 
 
 if __name__ == "__main__":
