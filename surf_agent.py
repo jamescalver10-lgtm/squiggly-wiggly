@@ -10,7 +10,8 @@ print("Squiggly Wiggly surf agent started...")
 # ============================================================
 
 # Must match the topic subscribed to in your ntfy phone app.
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "james-ct-surf-alerts-2026")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "james-ct-surf-alerts-2026"
+print("Topic source:", "GitHub secret" if os.environ.get("NTFY_TOPIC") else "local fallback")
 
 SEND_TEST_MESSAGE = False   # True = also send a "connection check" ping each run
 
