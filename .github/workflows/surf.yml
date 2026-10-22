@@ -1,0 +1,26 @@
+name: Daily surf check
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # 04:00 UTC = 06:00 South African time
+  workflow_dispatch:       # adds a "Run workflow" button for manual tests
+
+jobs:
+  surf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run surf agent
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python surf_agent.py
