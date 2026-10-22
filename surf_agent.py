@@ -22,7 +22,12 @@ TEST_MODE = False
 VERBOSE = True              # True = print forecast samples for every spot
 
 LOOKAHEAD_DAYS = 3          # look at today + this many days ahead
-MAX_SPOTS_IN_MESSAGE = 12   # keeps the phone notification a readable length
+MAX_NAMES_PER_LINE = 3      # spot names shown per notification line ("...and 4 more")
+MAX_LINES_IN_MESSAGE = 3    # notification lines (one per time slot) before "plus N more"
+
+# Monday-Friday you only get alerts for these spots (the ones you can reach before or
+# after work). Saturday and Sunday alerts cover every spot. Names must match SURF_SPOTS.
+WEEKDAY_SPOTS = ["Big Bay", "Bloubergstrand", "Glen Beach"]
 
 # South Africa has no daylight saving, so a fixed UTC+2 offset is always correct.
 TIMEZONE = timezone(timedelta(hours=2), "SAST")
@@ -634,6 +639,59 @@ def format_forecast(hour):
 # 4. MAIN LOGIC
 # ============================================================
 
+def hour_words(t):
+    h = t.hour % 12 or 12
+    return f"{h}{'am' if t.hour < 12 else 'pm'}"
+
+
+def when_words(t, now):
+    """e.g. 'tomorrow morning at 6am', 'Saturday morning at 7am', 'this evening at 5pm'."""
+    diff = (t.date() - now.date()).days
+    part = "morning" if t.hour < 12 else "afternoon" if t.hour < 17 else "evening"
+    if diff == 0:
+        day = "this"
+    elif diff == 1:
+        day = "tomorrow"
+    else:
+        day = t.strftime("%A")
+    return f"{day} {part} at {hour_words(t)}"
+
+
+def names_words(names):
+    shown = names[:MAX_NAMES_PER_LINE]
+    extra = len(names) - len(shown)
+    if extra > 0:
+        return ", ".join(shown) + f" and {extra} more"
+    if len(shown) == 1:
+        return shown[0]
+    return ", ".join(shown[:-1]) + " and " + shown[-1]
+
+
+def build_message(matches, now):
+    """Short, friendly lines grouped by time slot."""
+    groups = {}
+    for name, hour in matches:
+        groups.setdefault(hour["time"], []).append(name)
+
+    lines = []
+    for t in sorted(groups):
+        names = groups[t]
+        verb = "looks" if len(names) == 1 else "look"
+        lines.append(f"{names_words(names)} {verb} good {when_words(t, now)}.")
+
+    if len(lines) > MAX_LINES_IN_MESSAGE:
+        hidden = len(lines) - MAX_LINES_IN_MESSAGE
+        lines = lines[:MAX_LINES_IN_MESSAGE] + [f"Plus {hidden} more time slot(s) coming up."]
+    return "\n".join(lines)
+
+
+def is_allowed_spot_day(spot_name, t):
+    """Weekdays: only your short list of nearby spots. Weekends: every spot."""
+    if t.weekday() < 5:
+        return spot_name in WEEKDAY_SPOTS
+    return True
+
+
 def check_all_spots():
     now = datetime.now(TIMEZONE)
     last_day = (now + timedelta(days=LOOKAHEAD_DAYS)).date()
@@ -668,6 +726,8 @@ def check_all_spots():
                 continue
             if not slot_is_surfable(t, daylight):
                 continue
+            if not is_allowed_spot_day(spot_name, t):
+                continue
             if is_good(h, spot):
                 found = h
                 break
@@ -687,20 +747,15 @@ def check_all_spots():
                    "respond. I'll try again tomorrow morning.")
         title = "Squiggly Wiggly - Forecast Unavailable"
     elif matches:
-        lines = [f"- {name}: {day_label(h['time'], now)} {h['time']:%H:%M} | "
-                 f"{h['swell_m']:.1f}m {h['period_s']:.0f}s {h['swell_dir']} | "
-                 f"{h['wind_kn']:.0f}kn {h['wind_dir']}{tide_text(h)}"
-                 for name, h in matches[:MAX_SPOTS_IN_MESSAGE]]
-        extra = len(matches) - MAX_SPOTS_IN_MESSAGE
-        if extra > 0:
-            lines.append(f"...and {extra} more spots.")
-        message = (f"Surf windows outside work hours, next {LOOKAHEAD_DAYS} days "
-                   f"[{mode}]:\n" + "\n".join(lines))
-        title = "Squiggly Wiggly - Surf Windows"
+        message = build_message(matches, now)
+        title = "Squiggly Wiggly"
     else:
-        message = (f"No spots match your conditions outside work hours in the next "
-                   f"{LOOKAHEAD_DAYS} days [{mode}]. Check back tomorrow morning.")
-        title = "Squiggly Wiggly - No Surf Today"
+        message = (f"Nothing looks good in the next {LOOKAHEAD_DAYS} days. "
+                   f"I'll check again tomorrow morning.")
+        title = "Squiggly Wiggly"
+
+    if TEST_MODE and failed != total:
+        message = "[TEST MODE - relaxed, not surf advice]\n" + message
 
     if 0 < failed < total:
         message += f"\n({failed} spot(s) could not be checked.)"
